@@ -10,15 +10,21 @@ The script manages its own representation of MUD and SAND parameters and provide
 a main update function to be called by BeamNG's Lua environment, typically during
 a physics update.
 
+It now attempts a more robust material identification by first trying to use
+`editor_terrainEditor.getMaterialsInJson()` to dynamically fetch material names.
+If this is unavailable or fails, it relies on user-configured fallback mappings.
+
 IMPORTANT: This script modifies Lua tables that *represent* ground parameters.
 Actual application of these parameters to the BeamNG physics engine requires
 additional engine-specific Lua API calls, as detailed in the integration
 instructions at the end of this file. The accuracy of MUD/SAND detection
-heavily relies on the correct implementation of `M:getMaterialNameById()`.
+heavily relies on the correct functioning or configuration of `M:getMaterialNameById()`.
 --]]
 
 -- Module table 'M' encapsulates all public state and functions.
-local M = {}
+local M = {
+    materialNameCache = nil -- Initialize cache for material ID to name mapping. Populated on first use.
+}
 
 -- Holds the original, unmodified parameters for MUD and SAND.
 -- These are used as a baseline for dynamic modifications and for the recovery process.
@@ -109,38 +115,91 @@ local parameter_limits = {
 }
 
 ---
--- Translates a ground material ID to its name (e.g., "MUD", "SAND").
--- **CRITICAL USER TASK:** This function MUST be correctly implemented or adapted
--- for the script to identify MUD and SAND materials. Without correct mapping,
--- dynamic effects will not be applied to these surfaces.
+-- Translates a ground material ID to its internal name (e.g., "MUD", "SAND_BEACH").
 --
--- The current implementation is a PLACEHOLDER with example IDs.
--- Users should:
--- 1. Determine the actual material IDs for MUD, SAND (and potentially others)
---    in their specific BeamNG level or setup. These IDs can vary.
--- 2. Update the conditional logic below with the correct IDs.
--- 3. Alternatively, if a BeamNG API call exists to get material names from IDs
---    (e.g., `core_groundmodelManager.getMaterialNameById(material_id)`),
---    that should be used instead of manual mapping.
+-- Operation:
+-- 1. Caching: On the first call, it attempts to populate `self.materialNameCache` by
+--    querying `editor_terrainEditor.getMaterialsInJson()`. This API (if available)
+--    provides a list of materials used in the current level, including their IDs
+--    and internal names. The cache stores these mappings (ID as string key) to
+--    avoid repeated API calls.
+-- 2. Cache Lookup: Subsequent calls first try to find the material name in the cache.
+-- 3. Fallback: If `editor_terrainEditor` or its function is unavailable (e.g., in some
+--    gameplay contexts where editor scripts are not loaded), or if the cache population
+--    fails, or if an ID is not found in the cache, the function resorts to a
+--    hardcoded list of example material IDs.
+--
+-- **CRITICAL USER TASK - Fallback Configuration:**
+-- The hardcoded fallback IDs (e.g., 0 for ASPHALT, "10" for MUD, "11" for SAND)
+-- are **PLACEHOLDERS AND LIKELY INCORRECT** for any specific BeamNG level or setup.
+-- If the primary method (using `editor_terrainEditor`) is not functional or
+-- reliable in your target environment, **YOU MUST VERIFY AND UPDATE THESE FALLBACK IDs**
+-- in the code below. Failure to do so will result in MUD and SAND not being
+-- correctly identified, and thus, the dynamic effects will not apply.
+-- Refer to the integration instructions at the end of this file for tips on finding IDs.
+--
+-- Log Messages:
+-- - 'I' (Info): Successful caching of material names.
+-- - 'W' (Warning): `editor_terrainEditor` API issues or empty results, indicating
+--   reliance on fallbacks.
+-- - 'D' (Debug, commented out): Can be enabled to log when fallback is used for a specific ID.
 --
 -- @param self (table) The module instance (M).
 -- @param material_id (number) The physics material ID from `wheel_obj.contactMaterialID1`.
--- @return (string) The name of the material or a placeholder if not recognized.
+-- @return (string) The internal name of the material or a placeholder string
+--                  (e.g., "UNKNOWN_MATERIAL_ID_xx") if not recognized.
 ---
 function M:getMaterialNameById(material_id)
-    -- USER ACTION REQUIRED: Replace placeholder IDs with actual BeamNG material IDs.
-    -- These IDs are EXAMPLES ONLY and likely incorrect for your specific setup.
-    -- Consult BeamNG documentation, level data, or use in-game tools to find correct IDs.
-    if material_id == 10 then return "MUD"  -- EXAMPLE ID for MUD
-    elseif material_id == 11 then return "SAND" -- EXAMPLE ID for SAND
-    elseif material_id == 0 then return "ASPHALT" -- Asphalt is often ID 0 or 1 but can vary
-    -- Add other common materials here if their IDs are known, to reduce "UNKNOWN" messages.
-    -- elseif material_id == XX then return "GRASS"
+    if self.materialNameCache == nil then -- Only try to populate if nil (never tried before)
+        self.materialNameCache = {} -- Initialize to empty table, marking that we've tried
+
+        if editor_terrainEditor and editor_terrainEditor.getMaterialsInJson then
+            -- Note: `updateMaterialLibrary` might be needed if materials change dynamically
+            -- during editor use, but could be risky/slow in gameplay. Omitted for now.
+            local materials_json = editor_terrainEditor.getMaterialsInJson()
+            if materials_json then
+                local count = 0
+                for id_key, mtl_data in pairs(materials_json) do
+                    if mtl_data and mtl_data.internalName then
+                        self.materialNameCache[tostring(id_key)] = mtl_data.internalName
+                        count = count + 1
+                    end
+                end
+                if count > 0 then
+                    log('I', 'DynamicGround', 'Successfully cached ' .. count .. ' terrain material names from editor_terrainEditor.')
+                else
+                    log('W', 'DynamicGround', 'editor_terrainEditor.getMaterialsInJson() returned no materials or unexpected structure. Cache empty, will use fallbacks.')
+                end
+            else
+                log('W', 'DynamicGround', 'editor_terrainEditor.getMaterialsInJson() returned nil. Cannot cache from editor API, will use fallbacks.')
+            end
+        else
+            log('W', 'DynamicGround', 'editor_terrainEditor or .getMaterialsInJson not available. Cannot cache from editor API, will use fallbacks.')
+        end
     end
-    -- If the ID is not specifically mapped, return a generic name. This helps in debugging
-    -- if new, unmapped materials are encountered.
-    return "UNKNOWN_MATERIAL_ID_" .. tostring(material_id)
+
+    local id_str = tostring(material_id)
+    if self.materialNameCache[id_str] then -- Check populated cache (even if it's empty from a failed API call)
+        return self.materialNameCache[id_str]
+    end
+    
+    -- Fallback if not in cache or cache population failed.
+    -- log('D', 'DynamicGround', 'Material ID ' .. id_str .. ' not in cache. Using hardcoded fallback.')
+
+    -- !! USER ACTION REQUIRED FOR FALLBACKS !!
+    -- The following IDs are EXAMPLES and VERY LIKELY INCORRECT for your specific map/setup.
+    -- Update these if the editor_terrainEditor method is not working or not available.
+    if material_id == 0 then return "ASPHALT"  -- Often ID 0, but verify.
+    elseif id_str == "10" then return "MUD"   -- PURELY AN EXAMPLE ID
+    elseif id_str == "11" then return "SAND"  -- PURELY AN EXAMPLE ID
+    -- Add more verified fallback mappings here:
+    -- elseif id_str == "your_mud_id_as_string" then return "MUD"
+    -- elseif id_str == "your_sand_id_as_string" then return "SAND"
+    end
+    
+    return "UNKNOWN_MATERIAL_ID_" .. id_str
 end
+
 
 ---
 -- Gradually recovers modified ground parameters in `M.data` towards their
@@ -222,7 +281,8 @@ end
 ---
 -- Detects significant tire spin on soft surfaces (MUD or SAND).
 -- This function uses common BeamNG API patterns to access vehicle and wheel data.
--- It relies on `self:getMaterialNameById()` to identify relevant ground materials.
+-- It relies on `self:getMaterialNameById()` to identify relevant ground materials;
+-- the accuracy of this function is critical.
 --
 -- @param self (table) The module instance (M).
 -- @return (table) A list of tables, where each entry represents a wheel
@@ -235,68 +295,32 @@ end
 ---
 function M:detect_tire_spin_on_soft_surfaces()
     local spinning_wheels = {}
-    -- Threshold for "significant" spin (wheel surface speed > vehicle speed + threshold).
-    local spin_threshold = 5.0 -- m/s; tune this value based on desired sensitivity.
+    local spin_threshold = 5.0
 
-    -- Get the current player's vehicle object using the global 'be' (BeamEngine) object.
     local veh = be:getPlayerVehicle(0)
-    if not veh then
-        -- Optional: log this if it's unexpected during gameplay.
-        -- log('D', 'DynamicGround', 'No player vehicle found.') 
-        return spinning_wheels
-    end
+    if not veh then return spinning_wheels end
 
-    -- Access the vehicle's wheels collection.
-    -- `veh.wheels` is assumed to be an array-like table of wheel objects based on common patterns.
     local vehicle_wheels = veh.wheels
-    if not vehicle_wheels then
-        -- Optional: log this.
-        -- log('D', 'DynamicGround', 'Vehicle has no wheels data.')
-        return spinning_wheels
-    end
+    if not vehicle_wheels then return spinning_wheels end
 
-    -- Get the vehicle's general speed from `electrics.values.wheelspeed`.
-    -- This is a simplification. For higher accuracy, per-wheel ground speed relative
-    -- to the chassis would be ideal if easily accessible and performant.
     local vehicle_speed = electrics.values.wheelspeed or 0
 
-    -- Iterate through each wheel of the vehicle.
     for i = 1, #vehicle_wheels do
         local wheel_obj = vehicle_wheels[i]
-
         if wheel_obj then
-            -- Skip wheels that are broken/detached.
             if wheel_obj.isBroken then goto continue_wheel_loop end
-
-            -- Check for valid ground contact:
-            -- `contactMaterialID1` (physics ID of the material the wheel is contacting) should be a valid ID (>= 0).
-            -- `contactDepth == 0` suggests direct contact, not e.g. deep submersion that might
-            -- be handled differently by physics. This condition might need refinement based on
-            -- how BeamNG reports contact in various scenarios (e.g., shallow mud vs. deep mud).
             if wheel_obj.contactMaterialID1 and wheel_obj.contactMaterialID1 >= 0 and wheel_obj.contactDepth == 0 then
-                -- Translate material ID to a name using our (user-configurable) mapping function.
-                -- This is a critical step for identifying MUD and SAND.
+                -- Critical step: identify material name from its physics ID.
+                -- Correctness of getMaterialNameById (either via editor API or user-set fallbacks) is key.
                 local material_name = self:getMaterialNameById(wheel_obj.contactMaterialID1)
 
-                -- Process only if the identified material is MUD or SAND AND is defined in our `M.data`.
                 if (material_name == "MUD" or material_name == "SAND") and self.data[material_name] then
-                    -- Consider only wheels that are actively driven by the powertrain (`isPropulsed`).
-                    -- Non-propelled wheels can spin (e.g., if locked up during braking), but
-                    -- typically don't cause the "digging" effect this script aims to simulate.
                     if wheel_obj.isPropulsed then
-                        -- Calculate wheel's linear surface velocity: angular velocity (rad/s) * radius (m).
-                        -- `angularVelocity` is from the wheel physics.
-                        -- `radius` is the wheel's physical radius.
-                        -- Default radius (e.g., 0.3m) used if `wheel_obj.radius` is nil, though unlikely for a valid wheel.
                         local wheel_linear_velocity = (wheel_obj.angularVelocity or 0) * (wheel_obj.radius or 0.3)
-                        
-                        -- Calculate slip amount relative to vehicle speed.
                         local slip_amount = wheel_linear_velocity - vehicle_speed
-
-                        -- If wheel linear velocity significantly exceeds vehicle speed, it's spinning.
                         if wheel_linear_velocity > vehicle_speed + spin_threshold then
                             table.insert(spinning_wheels, {
-                                wheelID = wheel_obj.name, -- Standard BeamNG wheel name (e.g., "wheel_fl", "wheel_rr1")
+                                wheelID = wheel_obj.name,
                                 materialType = material_name,
                                 slipAmount = slip_amount
                             })
@@ -305,7 +329,7 @@ function M:detect_tire_spin_on_soft_surfaces()
                 end
             end
         end
-        ::continue_wheel_loop:: -- Lua's goto for continuing the loop from a nested conditional.
+        ::continue_wheel_loop::
     end
     return spinning_wheels
 end
@@ -321,43 +345,14 @@ end
 -- @param dt (number) The delta time from the physics simulation step (time since last call).
 ---
 function M:update_dynamic_ground(dt)
-  -- Step 1: Detect wheel spin on soft surfaces using current vehicle & wheel states.
   local spinning_wheels = self:detect_tire_spin_on_soft_surfaces()
-
-  -- Step 2: If significant spin is detected on MUD or SAND, modify their parameters.
   if #spinning_wheels > 0 then
     self:modify_ground_parameters_on_spin(spinning_wheels, dt)
   end
-
-  -- Step 3: Always call recovery function to allow ground to revert to its original state over time.
   self:recover_ground_parameters(dt)
-
   -- Step 4: (IMPORTANT - CONCEPTUAL) Apply changes to BeamNG Engine.
-  -- The parameters in `self.data.MUD` and `self.data.SAND` are now updated in Lua.
-  -- To make these changes affect game physics, BeamNG-specific API calls are needed here.
-  -- This script *manages the state*; applying it to the engine is a separate integration step.
-  -- Example (fictional API calls - consult BeamNG documentation for actual methods):
-  --   engine.updateGroundModelProperties('MUD', self.data.MUD)
-  --   engine.updateGroundModelProperties('SAND', self.data.SAND)
+  -- Consult BeamNG modding documentation for the correct API.
 end
-
---[[
-Example of how BeamNG might load and call this module (conceptual):
--- In a BeamNG Lua extension, vehicle controller, or level script:
--- local dynamicGroundSystem = require('path/to/dynamic_ground') -- Adjust path as needed
-
--- During a physics update callback (e.g., onPhysicsUpdate(dt) or similar)
--- function onPhysicsUpdate(dt)
---   if dynamicGroundSystem then
---     dynamicGroundSystem:update_dynamic_ground(dt)
---   end
---   -- ... other update logic
--- end
-
--- To get current ground model data (e.g., for custom UI or other game logic systems)
--- local currentMudParams = dynamicGroundSystem.data.MUD
--- print("Current MUD defaultDepth: " .. currentMudParams.defaultDepth)
-]]
 
 return M
 
@@ -393,46 +388,52 @@ properties (specifically MUD and SAND) based on vehicle wheel spin.
      -- end
      ```
 
-4. CRITICAL USER TASK: Implement `M:getMaterialNameById(material_id)`:
-   - The function `M:getMaterialNameById(material_id)` in this script is a PLACEHOLDER.
-   - **You MUST modify this function** to correctly map BeamNG's physics material IDs
-     (integers obtained from `wheel_obj.contactMaterialID1`) to material names
-     ("MUD", "SAND", etc.).
-   - Without correct mapping, this script CANNOT identify MUD or SAND, and the
-     dynamic effects will not work.
-   - To find material IDs:
-     - Check BeamNG documentation or ground model definition files (e.g., groundmodels.json).
-     - Use in-game debugging tools to inspect `wheel_obj.contactMaterialID1` when on known surfaces.
-   - Update the `if/elseif` conditions in `M:getMaterialNameById` with the correct IDs.
-   - Alternatively, if BeamNG provides a direct API to get material names from IDs
-     (e.g., `core_groundmodelManager.getMaterialNameById(id)`), use that API within the function.
+4. CRITICAL USER TASK: Material Identification (`M:getMaterialNameById`):
+   - The function `M:getMaterialNameById(material_id)` is crucial for identifying MUD and SAND.
+   - **Primary Method (Editor API):** It first attempts to use `editor_terrainEditor.getMaterialsInJson()`
+     to dynamically fetch all material names and cache them. This is the preferred method if it
+     works in your execution context (e.g., if `editor_terrainEditor` is available).
+     Check console logs for 'DynamicGround' messages about cache success or failure.
+   - **Fallback Method (Manual Configuration):** If the editor API method fails (e.g.,
+     `editor_terrainEditor` is not available during normal gameplay, or returns no data),
+     the script will use hardcoded fallback example IDs within `M:getMaterialNameById`.
+     **THESE FALLBACK IDs (e.g., 10 for MUD, 11 for SAND) ARE PLACEHOLDERS AND ARE
+     VERY LIKELY INCORRECT FOR YOUR SPECIFIC MAP/SETUP.**
+   - **Action Required:**
+     1. Test if the editor API method successfully caches materials (see logs).
+     2. If not, or to be safe, you **MUST** identify the correct physics material IDs
+        (these are usually numbers, but the function converts them to strings for lookup)
+        for MUD, SAND, ASPHALT, etc., on your target map(s).
+     3. **Update the fallback `if/elseif` conditions in `M:getMaterialNameById`** with these
+        correct, verified IDs.
+   - **Finding Material IDs:**
+     - Temporarily add `print(wheel_obj.name, wheel_obj.contactMaterialID1)` inside the wheel
+       loop in `M:detect_tire_spin_on_soft_surfaces()` to see the raw ID when driving on known surfaces.
+     - Consult BeamNG documentation, level data (e.g., terrain files), or ground model
+       definition files (e.g., groundmodels.json, though these map names to properties, not IDs directly).
+   - **Without correct material identification, dynamic effects will not apply to MUD/SAND.**
 
 5. Dependencies & API Assumptions:
-   - This script assumes access to standard BeamNG Lua environment features and common vehicle/wheel properties:
-     - `be:getPlayerVehicle(0)`: To get the current player vehicle.
-     - `veh.wheels`: A collection (likely array) of wheel objects/tables.
-     - Wheel Properties: `name`, `contactMaterialID1`, `contactDepth`, `angularVelocity`,
-       `radius`, `isBroken`, `isPropulsed` for each wheel object.
-     - `electrics.values.wheelspeed`: For overall vehicle speed.
-   - While these patterns are common (e.g., seen in `vehicleController.lua`), the exact structure
-     of `veh.wheels` or specific property names might vary slightly with vehicle mods or
-     BeamNG updates. Adjust property access if needed.
+   - `be:getPlayerVehicle(0)`: To get the current player vehicle.
+   - `veh.wheels`: A collection (likely array) of wheel objects/tables.
+   - Wheel Properties: `name`, `contactMaterialID1`, `contactDepth`, `angularVelocity`,
+     `radius`, `isBroken`, `isPropulsed`.
+   - `electrics.values.wheelspeed`: For overall vehicle speed.
+   - `editor_terrainEditor.getMaterialsInJson()`: Conditionally used for material name caching.
+     If unavailable, the script relies on user-configured fallbacks in `M:getMaterialNameById`.
+   - Exact property names/structures might vary with mods or BeamNG versions; adjust if needed.
 
 6. Engine Interaction (Conceptual - IMPORTANT):
-   - This script *manages the logic and state* for dynamic ground parameters in Lua tables
-     (`M.data.MUD`, `M.data.SAND`).
-   - To make these changes affect in-game physics, you must use BeamNG-specific Lua API
-     functions to apply these Lua table values to the actual game engine's ground models.
-   - This "bridging" step is NOT part of this script and requires consulting BeamNG
-     modding documentation for functions like `engine.setGroundModelProperty()` (fictional example)
-     or similar APIs that can modify ground properties at runtime.
+   - This script manages Lua tables (`M.data.MUD`, `M.data.SAND`). To affect in-game physics,
+     you must use BeamNG-specific Lua APIs to apply these values to the engine's ground models.
+     This "bridging" step is external to this script.
 
 7. Accessing Modified Data:
-   - Current parameters can be read from `dynamicGroundSystem.data.MUD` or `dynamicGroundSystem.data.SAND`.
+   - Read current parameters from `dynamicGroundSystem.data.MUD` or `dynamicGroundSystem.data.SAND`.
 
 8. Debugging:
-   - Use `print()` statements or BeamNG's Lua console to inspect values (e.g., material IDs,
-     `M.data` contents) to verify behavior and troubleshoot the `getMaterialNameById` mapping.
+   - Use `print()` or `log('D', 'DynamicGround', ...)` and BeamNG console.
+   - Check console for 'DynamicGround' logs regarding material caching and fallbacks.
 
 Remember to consult official BeamNG modding documentation and community resources.
 ------------------------------------------------------------------------------------------
@@ -441,84 +442,73 @@ Remember to consult official BeamNG modding documentation and community resource
 -- Testing Strategy for dynamic_ground.lua
 ------------------------------------------------------------------------------------------
 
-Once integrated and `M:getMaterialNameById()` is correctly implemented, use these steps
+Once integrated and `M:getMaterialNameById()` is correctly implemented or verified, use these steps
 to test the script's functionality within BeamNG:
 
 1.  Prerequisites for Testing:
-    *   **Script Loaded:** Confirm `dynamic_ground.lua` is loaded by BeamNG (e.g., using
-        `require` in a game script like a level's main.lua or a vehicle extension).
-    *   **Update Function Called:** Ensure `M:update_dynamic_ground(dt)` (e.g., via
-        `yourLoadedModuleName:update_dynamic_ground(dt)`) is called every physics frame
-        from a suitable callback like `onPhysicsUpdate(dt)`.
-    *   **`getMaterialNameById` Implemented:** THIS IS CRUCIAL. Verify that
-        `M:getMaterialNameById()` has been updated with the correct physics material IDs
-        for MUD and SAND specific to your BeamNG level or map setup. Without this,
-        no dynamic effects will occur on these surfaces.
+    *   **Script Loaded:** Confirm `dynamic_ground.lua` is loaded.
+    *   **Update Function Called:** Ensure `M:update_dynamic_ground(dt)` is called every physics frame.
+    *   **`getMaterialNameById` Configuration:** THIS IS THE MOST CRUCIAL STEP.
+        *   If you expect `editor_terrainEditor.getMaterialsInJson()` to work (e.g., you are running
+            in a context where editor APIs are available, like the World Editor):
+            Check the game's console/log for a message like "Successfully cached ... terrain material names".
+        *   If the editor API is not available or fails (check logs for warnings like
+            "...editor_terrainEditor not available..." or "...getMaterialsInJson() returned nil..."),
+            ensure you have **MANUALLY VERIFIED AND UPDATED THE FALLBACK EXAMPLE IDs** in the
+            `M:getMaterialNameById()` function for MUD, SAND, and any other relevant materials
+            for your specific map.
+        *   Without correct material ID mapping (either dynamic or manual fallback), the script CANNOT
+            identify MUD/SAND, and no dynamic effects will occur on these surfaces.
 
 2.  Basic MUD/SAND Detection Test:
-    *   **Add Logging:** Temporarily add `print()` or `log()` statements:
+    *   **Check Logs First:** Review the game's console/log for messages from `DynamicGround`
+        related to material caching (e.g., "Successfully cached terrain material names" or
+        warnings if it failed). This indicates which lookup method `M:getMaterialNameById()` is using.
+    *   **Add Temporary Logging (If Needed):**
         *   Inside `M:detect_tire_spin_on_soft_surfaces()`: When `material_name` is
-            determined to be "MUD" or "SAND", log the `wheel_obj.name` and `material_name`.
-            Example: `log('D', 'DynamicGround', "Wheel " .. wheel_obj.name .. " on " .. material_name)`
-        *   Inside `M:update_dynamic_ground()`: Log the contents of the `spinning_wheels`
-            table if it's not empty. Example: `if #spinning_wheels > 0 then log('D', 'DynamicGround', "Spinning wheels: " .. serpent.block(spinning_wheels)) end`
-            (You might need a `serpent` library or similar for easy table printing, or print manually).
+            determined to be "MUD" or "SAND" (after the call to `self:getMaterialNameById`),
+            log the `wheel_obj.name`, `material_name`, and `wheel_obj.contactMaterialID1`.
+            Example: `log('D', 'DynamicGround', "Wheel " .. wheel_obj.name .. " on " .. material_name .. " (ID: " .. wheel_obj.contactMaterialID1 .. ")")`
+        *   Inside `M:update_dynamic_ground()`: Log the `spinning_wheels` table if it's not empty.
+            Example: `if #spinning_wheels > 0 then log('D', 'DynamicGround', "Spinning wheels: " .. serpent.block(spinning_wheels)) end`
+            (Requires `serpent` or similar for easy table printing).
     *   **Test Drive:** Drive onto a known MUD surface, then a known SAND surface.
-    *   **Check Logs:** Observe the BeamNG console or log files.
-        *   Verify the script correctly identifies when wheels are on MUD or SAND.
-        *   Spin the tires on these surfaces (e.g., hold brake and throttle, or accelerate hard).
-        *   Confirm the `spinning_wheels` table gets populated with entries for the spinning wheels,
-            showing correct material type and slip amount.
+    *   **Verify Detection:** Check logs to confirm:
+        *   The script correctly identifies when wheels are on MUD or SAND based on the names from `getMaterialNameById`.
+        *   The `spinning_wheels` table populates when tires spin on these surfaces.
 
 3.  Parameter Modification Test (`M.data` Inspection):
-    *   **Access Lua Console:** Open BeamNG's Lua console (usually `~` key).
-    *   **Inspect `M.data`:** Use commands to print the dynamic parameters. Example:
-        `pp(require('your_mod_name/lua/dynamic_ground').data.MUD)`
-        (Adjust the path to how you've `require`d the script).
-    *   **Perform Test:**
-        1. Drive onto a MUD surface.
-        2. Spin the tires significantly for several seconds.
-        3. Pause the game (if possible while keeping console active) or quickly switch to console.
-        4. Inspect `M.data.MUD`.
-    *   **Expected Behavior:**
-        *   `defaultDepth` should have increased.
-        *   `shearStrength`, `staticFrictionCoefficient`, `slidingFrictionCoefficient`
-            should have decreased.
-        *   Changes should be within the bounds set by `parameter_limits`.
-    *   Repeat the test for a SAND surface and inspect `M.data.SAND`.
+    *   **Lua Console:** Use `pp(require('path/to/dynamic_ground').data.MUD)` (adjust path as loaded).
+    *   **Perform Test:** Drive onto MUD, spin tires for some seconds, then inspect `M.data.MUD`.
+    *   **Expected Behavior:** `defaultDepth` increases; `shearStrength`, friction coefficients decrease,
+        all within `parameter_limits`. Repeat for SAND and `M.data.SAND`.
 
 4.  Parameter Recovery Test:
-    *   **Modify Parameters:** Perform the test above to modify parameters for MUD or SAND.
-    *   **Cease Spin:** Move the vehicle off the dynamic surface or onto a hard surface,
-        or simply stop spinning the tires.
-    *   **Observe Recovery:** Periodically inspect `M.data.MUD` (or `M.data.SAND`) using
-        the Lua console over time (e.g., every 10-20 seconds of gameplay).
-    *   **Expected Behavior:** The parameters that were changed should gradually revert
-        towards their original values (as defined in `originalGroundModelValues`).
-        The recovery is not instant.
+    *   **Modify Parameters:** As above.
+    *   **Cease Spin:** Move vehicle off the dynamic surface or stop spinning tires.
+    *   **Observe Recovery:** Periodically inspect `M.data.MUD` or `M.data.SAND` via console.
+    *   **Expected Behavior:** Parameters gradually revert to original values.
 
 5.  `collisionType` Immutability Check:
-    *   While inspecting `M.data.MUD` or `M.data.SAND` during the tests above, also
-        confirm that the `collisionType` field has *not* changed from its original
-        string value (e.g., "MUD" should remain "MUD"). This script should not alter it.
+    *   When inspecting `M.data`, confirm `collisionType` string remains unchanged.
 
 6.  Troubleshooting Tips:
     *   **MUD/SAND Not Detected:**
-        *   This is almost always due to incorrect material IDs in `M:getMaterialNameById()`.
-        *   Temporarily add `print(wheel_obj.name, wheel_obj.contactMaterialID1)` inside the
-            wheel loop in `M:detect_tire_spin_on_soft_surfaces()` to see the actual
-            material ID your vehicle is on. Compare this ID with what you have in
-            `M:getMaterialNameById()`.
-    *   **Parameters Not Changing (or not enough):**
-        *   Verify `M:update_dynamic_ground(dt)` is being called every frame.
-        *   Add `print()` statements inside `M:modify_ground_parameters_on_spin` to see
-            if it's being triggered and what `slip_amount` values it's receiving.
-        *   The `spin_threshold` in `M:detect_tire_spin_on_soft_surfaces()` might be too high.
-        *   The `*_factor` values in `M:modify_ground_parameters_on_spin` might be too small.
-    *   **Parameters Change Too Quickly/Slowly or Recover Too Quickly/Slowly:**
-        *   Adjust the `*_factor` values in `M:modify_ground_parameters_on_spin`.
+        *   This is the most common issue and usually relates to `M:getMaterialNameById()`.
+        *   **Check Logs:** Look for 'DynamicGround' messages about caching success/failure.
+        *   **Verify Fallbacks:** If caching failed or isn't used, TRIPLE-CHECK that your fallback
+            IDs in `M:getMaterialNameById()` are correct for the map you are using.
+        *   **Log Raw IDs:** Add a temporary `log('D', 'DynamicGround', "Raw Contact ID: " .. wheel_obj.contactMaterialID1)`
+            in `M:detect_tire_spin_on_soft_surfaces` *before* calling `getMaterialNameById` to see
+            the actual ID numbers the game is reporting for the surfaces. Use these to correct your fallbacks.
+    *   **Parameters Not Changing:**
+        *   Confirm `M:update_dynamic_ground(dt)` is called (e.g., with a log at its start).
+        *   Log `slip_amount` in `M:modify_ground_parameters_on_spin`.
+        *   The `spin_threshold` in `M:detect_tire_spin_on_soft_surfaces()` might be too high/low.
+    *   **Parameters Change Too Quickly/Slowly:**
+        *   Adjust `*_factor` values in `M:modify_ground_parameters_on_spin`.
         *   Adjust `recovery_rate_factor` in `M:recover_ground_parameters`.
-    *   **Errors in Console:** Address any Lua errors reported in the console. They often
-        point to incorrect property access or logic issues.
+    *   **Warnings about `editor_terrainEditor`:** These are normal if not running in an editor context.
+        The script is designed to fall back. The key is to ensure the fallbacks are accurate.
 ------------------------------------------------------------------------------------------
 ]]
