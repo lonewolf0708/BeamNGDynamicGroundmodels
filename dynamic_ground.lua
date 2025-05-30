@@ -12,7 +12,8 @@ a physics update.
 
 It now attempts a more robust material identification by first trying to use
 `editor_terrainEditor.getMaterialsInJson()` to dynamically fetch material names.
-If this is unavailable or fails, it relies on user-configured fallback mappings.
+If this is unavailable or fails, it relies on a comprehensive, user-verifiable
+list of fallback material ID mappings.
 
 IMPORTANT: This script modifies Lua tables that *represent* ground parameters.
 Actual application of these parameters to the BeamNG physics engine requires
@@ -118,44 +119,46 @@ local parameter_limits = {
 -- Translates a ground material ID to its internal name (e.g., "MUD", "SAND_BEACH").
 --
 -- Operation:
--- 1. Caching: On the first call, it attempts to populate `self.materialNameCache` by
---    querying `editor_terrainEditor.getMaterialsInJson()`. This API (if available)
+-- 1. Caching: On the first call (`self.materialNameCache == nil`), it attempts to populate
+--    `self.materialNameCache` by querying `editor_terrainEditor.getMaterialsInJson()`.
+--    This API (if available, typically in editor contexts or if editor scripts are loaded)
 --    provides a list of materials used in the current level, including their IDs
 --    and internal names. The cache stores these mappings (ID as string key) to
---    avoid repeated API calls.
--- 2. Cache Lookup: Subsequent calls first try to find the material name in the cache.
--- 3. Fallback: If `editor_terrainEditor` or its function is unavailable (e.g., in some
---    gameplay contexts where editor scripts are not loaded), or if the cache population
---    fails, or if an ID is not found in the cache, the function resorts to a
---    hardcoded list of example material IDs.
+--    avoid repeated API calls and improve performance.
+-- 2. Cache Lookup: On every call, it first tries to find the material name in the
+--    (potentially populated) `self.materialNameCache`.
+-- 3. Fallback: If `editor_terrainEditor` or its `getMaterialsInJson` function is unavailable,
+--    or if the cache population fails to return any materials, or if a specific ID is not
+--    found in the cache, the function resorts to a comprehensive, hardcoded list of
+--    common material ID-to-name mappings. This list is based on typical values found in
+--    older `groundModels.json` files but may not be universally accurate.
 --
--- **CRITICAL USER TASK - Fallback Configuration:**
--- The hardcoded fallback IDs (e.g., 0 for ASPHALT, "10" for MUD, "11" for SAND)
--- are **PLACEHOLDERS AND LIKELY INCORRECT** for any specific BeamNG level or setup.
+-- **CRITICAL USER TASK - Verification of Fallback Configuration:**
+-- While the fallback list is more comprehensive, these hardcoded IDs **MAY STILL BE
+-- INCORRECT** for any specific BeamNG level, map, or game version.
 -- If the primary method (using `editor_terrainEditor`) is not functional or
--- reliable in your target environment, **YOU MUST VERIFY AND UPDATE THESE FALLBACK IDs**
--- in the code below. Failure to do so will result in MUD and SAND not being
--- correctly identified, and thus, the dynamic effects will not apply.
--- Refer to the integration instructions at the end of this file for tips on finding IDs.
+-- reliable in your target environment (check logs for warnings), **YOU MUST VERIFY
+-- AND POTENTIALLY UPDATE THESE FALLBACK IDs** in the code below. Failure to do so
+-- will result in MUD, SAND, and other materials not being correctly identified,
+-- and thus, the dynamic effects will not apply as intended.
+-- See "CRITICAL USER TASK: Material Identification" in the integration instructions
+-- at the end of this file for tips on finding correct material IDs.
 --
 -- Log Messages:
--- - 'I' (Info): Successful caching of material names.
--- - 'W' (Warning): `editor_terrainEditor` API issues or empty results, indicating
---   reliance on fallbacks.
--- - 'D' (Debug, commented out): Can be enabled to log when fallback is used for a specific ID.
+-- - 'I' (Info): Successful caching of material names via `editor_terrainEditor`.
+-- - 'W' (Warning): Issues with `editor_terrainEditor` API (unavailable, returned nil,
+--   or returned no materials), indicating reliance on the hardcoded fallback list.
 --
 -- @param self (table) The module instance (M).
 -- @param material_id (number) The physics material ID from `wheel_obj.contactMaterialID1`.
 -- @return (string) The internal name of the material or a placeholder string
---                  (e.g., "UNKNOWN_MATERIAL_ID_xx") if not recognized.
+--                  (e.g., "UNKNOWN_MATERIAL_ID_xx") if not recognized by cache or fallback.
 ---
 function M:getMaterialNameById(material_id)
     if self.materialNameCache == nil then -- Only try to populate if nil (never tried before)
         self.materialNameCache = {} -- Initialize to empty table, marking that we've tried
 
         if editor_terrainEditor and editor_terrainEditor.getMaterialsInJson then
-            -- Note: `updateMaterialLibrary` might be needed if materials change dynamically
-            -- during editor use, but could be risky/slow in gameplay. Omitted for now.
             local materials_json = editor_terrainEditor.getMaterialsInJson()
             if materials_json then
                 local count = 0
@@ -168,33 +171,52 @@ function M:getMaterialNameById(material_id)
                 if count > 0 then
                     log('I', 'DynamicGround', 'Successfully cached ' .. count .. ' terrain material names from editor_terrainEditor.')
                 else
-                    log('W', 'DynamicGround', 'editor_terrainEditor.getMaterialsInJson() returned no materials or unexpected structure. Cache empty, will use fallbacks.')
+                    log('W', 'DynamicGround', 'editor_terrainEditor.getMaterialsInJson() returned no materials or unexpected structure. Cache empty, will use comprehensive fallbacks.')
                 end
             else
-                log('W', 'DynamicGround', 'editor_terrainEditor.getMaterialsInJson() returned nil. Cannot cache from editor API, will use fallbacks.')
+                log('W', 'DynamicGround', 'editor_terrainEditor.getMaterialsInJson() returned nil. Cannot cache from editor API, will use comprehensive fallbacks.')
             end
         else
-            log('W', 'DynamicGround', 'editor_terrainEditor or .getMaterialsInJson not available. Cannot cache from editor API, will use fallbacks.')
+            log('W', 'DynamicGround', 'editor_terrainEditor or .getMaterialsInJson not available. Cannot cache from editor API, will use comprehensive fallbacks.')
         end
     end
 
-    local id_str = tostring(material_id)
-    if self.materialNameCache[id_str] then -- Check populated cache (even if it's empty from a failed API call)
+    local id_str = tostring(material_id) -- Ensure ID is string for cache consistency.
+    if self.materialNameCache and self.materialNameCache[id_str] then -- Check cache first (even if it's empty).
         return self.materialNameCache[id_str]
     end
     
-    -- Fallback if not in cache or cache population failed.
-    -- log('D', 'DynamicGround', 'Material ID ' .. id_str .. ' not in cache. Using hardcoded fallback.')
+    -- Fallback to a comprehensive list of known common material IDs if cache lookup fails or cache is empty.
+    -- The primary method (editor_terrainEditor) is preferred. This list is a secondary measure.
+    -- log('D', 'DynamicGround', 'Material ID ' .. id_str .. ' not found via editor_terrainEditor or cache. Using comprehensive fallback list.')
 
     -- !! USER ACTION REQUIRED FOR FALLBACKS !!
-    -- The following IDs are EXAMPLES and VERY LIKELY INCORRECT for your specific map/setup.
-    -- Update these if the editor_terrainEditor method is not working or not available.
-    if material_id == 0 then return "ASPHALT"  -- Often ID 0, but verify.
-    elseif id_str == "10" then return "MUD"   -- PURELY AN EXAMPLE ID
-    elseif id_str == "11" then return "SAND"  -- PURELY AN EXAMPLE ID
-    -- Add more verified fallback mappings here:
-    -- elseif id_str == "your_mud_id_as_string" then return "MUD"
-    -- elseif id_str == "your_sand_id_as_string" then return "SAND"
+    -- The following numeric IDs are based on a standard older groundModels.json but MAY NOT BE ACCURATE
+    -- for your specific map or BeamNG version. VERIFY these if the editor API method fails or is not available.
+    -- These are matched against the raw `material_id` (number).
+    if material_id == 0 then return "ASPHALT"       -- Common default, often used as a base.
+    elseif material_id == 10 then return "ASPHALT"     -- Previously an example for MUD, but often ASPHALT in some setups. Verify!
+    elseif material_id == 11 then return "ASPHALT_WET" -- Previously an example for SAND. Verify!
+    elseif material_id == 16 then return "SAND"
+    elseif material_id == 7  then return "BRANCHES_STRONG" -- Or a more generic "FOLIAGE" if preferred and if its properties match.
+    elseif material_id == 30 then return "COBBLESTONE"
+    elseif material_id == 15 then return "DIRT"
+    elseif material_id == 14 then return "DIRT_DUSTY"
+    elseif material_id == 20 then return "GRASS"
+    elseif material_id == 19 then return "GRAVEL"
+    elseif material_id == 21 then return "ICE"
+    elseif material_id == 31 then return "LEAVES_THIN" -- Or "FOLIAGE_THIN".
+    elseif material_id == 2  then return "METAL"
+    elseif material_id == 18 then return "MUD"
+    elseif material_id == 3  then return "PLASTIC"
+    elseif material_id == 13 then return "ROCK"
+    elseif material_id == 29 then return "RUMBLE_STRIP"
+    elseif material_id == 4  then return "SHOCK_ABSORBER" -- Unusual as a ground material, ensure this mapping is intended if used.
+    elseif material_id == 22 then return "SNOW"
+    elseif material_id == 32 then return "SPIKE_STRIP"
+    elseif material_id == 6  then return "WOOD"
+    -- Add more verified fallback mappings here based on your specific map/BeamNG version if necessary.
+    -- e.g., elseif material_id == your_map_specific_mud_id then return "MUD"
     end
     
     return "UNKNOWN_MATERIAL_ID_" .. id_str
@@ -396,21 +418,23 @@ properties (specifically MUD and SAND) based on vehicle wheel spin.
      Check console logs for 'DynamicGround' messages about cache success or failure.
    - **Fallback Method (Manual Configuration):** If the editor API method fails (e.g.,
      `editor_terrainEditor` is not available during normal gameplay, or returns no data),
-     the script will use hardcoded fallback example IDs within `M:getMaterialNameById`.
-     **THESE FALLBACK IDs (e.g., 10 for MUD, 11 for SAND) ARE PLACEHOLDERS AND ARE
-     VERY LIKELY INCORRECT FOR YOUR SPECIFIC MAP/SETUP.**
+     the script will use a comprehensive hardcoded fallback list of material IDs within
+     `M:getMaterialNameById`. While this list is based on common defaults (e.g., from older
+     `groundModels.json` structures), **THESE IDs STILL REQUIRE VERIFICATION** against
+     your specific map's terrain material definitions, as IDs can vary between maps and
+     BeamNG versions.
    - **Action Required:**
      1. Test if the editor API method successfully caches materials (see logs).
-     2. If not, or to be safe, you **MUST** identify the correct physics material IDs
-        (these are usually numbers, but the function converts them to strings for lookup)
-        for MUD, SAND, ASPHALT, etc., on your target map(s).
+     2. If not, or to be absolutely sure for your target map(s), you **MUST** identify the
+        correct physics material IDs (these are usually numbers) for MUD, SAND, ASPHALT, etc.
      3. **Update the fallback `if/elseif` conditions in `M:getMaterialNameById`** with these
-        correct, verified IDs.
+        correct, verified IDs for your map(s).
    - **Finding Material IDs:**
      - Temporarily add `print(wheel_obj.name, wheel_obj.contactMaterialID1)` inside the wheel
        loop in `M:detect_tire_spin_on_soft_surfaces()` to see the raw ID when driving on known surfaces.
-     - Consult BeamNG documentation, level data (e.g., terrain files), or ground model
-       definition files (e.g., groundmodels.json, though these map names to properties, not IDs directly).
+     - Consult BeamNG documentation, specific level data (e.g., terrain definition files if accessible),
+       or examine `groundModels.json` for material *names* and then try to find their corresponding
+       numeric IDs through testing or other game tools.
    - **Without correct material identification, dynamic effects will not apply to MUD/SAND.**
 
 5. Dependencies & API Assumptions:
@@ -454,9 +478,10 @@ to test the script's functionality within BeamNG:
             Check the game's console/log for a message like "Successfully cached ... terrain material names".
         *   If the editor API is not available or fails (check logs for warnings like
             "...editor_terrainEditor not available..." or "...getMaterialsInJson() returned nil..."),
-            ensure you have **MANUALLY VERIFIED AND UPDATED THE FALLBACK EXAMPLE IDs** in the
+            ensure you have **MANUALLY VERIFIED AND UPDATED THE COMPREHENSIVE FALLBACK LIST** in the
             `M:getMaterialNameById()` function for MUD, SAND, and any other relevant materials
-            for your specific map.
+            for your specific map. While the fallback list is extensive, **IT STILL REQUIRES VERIFICATION**
+            for your specific map/BeamNG version, as material IDs can differ.
         *   Without correct material ID mapping (either dynamic or manual fallback), the script CANNOT
             identify MUD/SAND, and no dynamic effects will occur on these surfaces.
 
@@ -497,7 +522,7 @@ to test the script's functionality within BeamNG:
         *   This is the most common issue and usually relates to `M:getMaterialNameById()`.
         *   **Check Logs:** Look for 'DynamicGround' messages about caching success/failure.
         *   **Verify Fallbacks:** If caching failed or isn't used, TRIPLE-CHECK that your fallback
-            IDs in `M:getMaterialNameById()` are correct for the map you are using.
+            IDs in `M:getMaterialNameById()` (the comprehensive list) are correct for the map you are using.
         *   **Log Raw IDs:** Add a temporary `log('D', 'DynamicGround', "Raw Contact ID: " .. wheel_obj.contactMaterialID1)`
             in `M:detect_tire_spin_on_soft_surfaces` *before* calling `getMaterialNameById` to see
             the actual ID numbers the game is reporting for the surfaces. Use these to correct your fallbacks.
