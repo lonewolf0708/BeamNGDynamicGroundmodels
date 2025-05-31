@@ -10,42 +10,49 @@ The script manages its own representation of MUD and SAND parameters and provide
 a main update function to be called by BeamNG's Lua environment, typically during
 a physics update.
 
-It now attempts a more robust material identification by first trying to use
-`editor_terrainEditor.getMaterialsInJson()` to dynamically fetch material names.
-If this is unavailable or fails, it relies on a comprehensive, user-verifiable
-list of fallback material ID mappings.
+It now attempts a more robust material identification:
+1. Primary Method: It tries to use `editor_terrainEditor.getMaterialsInJson()` to
+   dynamically fetch material names from the level and caches them.
+2. Fallback Method: If the primary method is unavailable or fails, it relies on a
+   comprehensive, hardcoded list of common material ID-to-name mappings. This
+   fallback list requires user verification for accuracy on specific maps.
 
-IMPORTANT: This script modifies Lua tables that *represent* ground parameters.
-Actual application of these parameters to the BeamNG physics engine requires
-additional engine-specific Lua API calls, as detailed in the integration
-instructions at the end of this file. The accuracy of MUD/SAND detection
-heavily relies on the correct functioning or configuration of `M:getMaterialNameById()`.
+IMPORTANT - Engine Linkage: This script *calculates and manages* the dynamic parameters
+in Lua tables. For these changes to affect actual in-game physics, users MUST
+implement additional Lua code to call appropriate BeamNG engine API functions that
+apply these Lua-managed parameters to the game's ground models. This script does
+not directly perform that engine linkage.
+
+IMPORTANT - Material Identification: The accuracy of MUD/SAND detection, and thus the
+entirety of this script's dynamic effects, heavily relies on the correct functioning
+or configuration of the `M:getMaterialNameById()` method. Users must ensure this
+is working correctly in their environment (see Integration Instructions, Point 4).
 --]]
 
 -- Module table 'M' encapsulates all public state and functions.
 local M = {
-    materialNameCache = nil -- Initialize cache for material ID to name mapping. Populated on first use.
+    materialNameCache = nil -- Stores cached material ID-to-name mappings. Populated on first use of getMaterialNameById.
 }
 
 -- Holds the original, unmodified parameters for MUD and SAND.
 -- These are used as a baseline for dynamic modifications and for the recovery process.
--- Structure mirrors BeamNG's groundmodel JSON format for relevant parameters.
+-- The structure mirrors relevant parts of BeamNG's groundmodel JSON format.
 local originalGroundModelValues = {
   MUD = {
-    staticFrictionCoefficient  = 0.55, -- Initial static friction
-    slidingFrictionCoefficient = 0.55, -- Initial sliding friction
-    hydrodynamicFriction       = 0.01, -- Friction component related to fluid dynamics
-    stribeckVelocity           = 6,    -- Velocity at which friction transitions from static to sliding
-    strength                   = 1,    -- General strength factor (less used in this script's dynamics)
-    roughnessCoefficient       = 0.5,  -- Surface roughness (less used in this script's dynamics)
-    fluidDensity               = 7000, -- Density of the material when behaving like a fluid
-    flowConsistencyIndex       = 2000, -- Viscosity-like property for fluid behavior
-    flowBehaviorIndex          = 0.5,  -- Exponent for non-Newtonian fluid behavior
-    dragAnisotropy             = 0.75, -- Directional dependency of drag (less used here)
-    shearStrength              = 4000, -- Material's resistance to shear forces (loosens when dug)
-    defaultDepth               = 0.15, -- Initial depth of the deformable layer (increases when dug)
-    collisionType              = "MUD",  -- BeamNG internal type, MUST NOT be changed dynamically by this script
-    skidMarks                  = false   -- Whether this material shows skid marks
+    staticFrictionCoefficient  = 0.55,
+    slidingFrictionCoefficient = 0.55,
+    hydrodynamicFriction       = 0.01,
+    stribeckVelocity           = 6,
+    strength                   = 1,
+    roughnessCoefficient       = 0.5,
+    fluidDensity               = 7000,
+    flowConsistencyIndex       = 2000,
+    flowBehaviorIndex          = 0.5,
+    dragAnisotropy             = 0.75,
+    shearStrength              = 4000,
+    defaultDepth               = 0.15,
+    collisionType              = "MUD",  -- BeamNG internal type; MUST NOT be changed by this script.
+    skidMarks                  = false
   },
   SAND = {
     staticFrictionCoefficient  = 0.6,
@@ -60,15 +67,15 @@ local originalGroundModelValues = {
     dragAnisotropy             = 0.5,
     shearStrength              = 12000,
     defaultDepth               = 0.1,
-    collisionType              = "SAND",
+    collisionType              = "SAND", -- BeamNG internal type; MUST NOT be changed by this script.
     skidMarks                  = false
   }
 }
 
 -- Utility function to create a deep copy of a table.
--- This is essential for initializing `M.data` from `originalGroundModelValues`
--- without creating a reference, so `originalGroundModelValues` remains pristine.
--- Handles nested tables, but not functions or userdata (sufficient for parameter tables).
+-- Essential for initializing `M.data` from `originalGroundModelValues` without creating
+-- a reference, ensuring `originalGroundModelValues` remains pristine for recovery logic.
+-- Handles nested tables; not designed for functions or userdata (sufficient for parameter tables).
 local function deepcopy(orig_table)
     local orig_type = type(orig_table)
     local copy
@@ -85,25 +92,28 @@ local function deepcopy(orig_table)
 end
 
 -- `M.data` stores the CURRENT, dynamically changing parameters for MUD and SAND.
--- It is initialized with a deep copy of `originalGroundModelValues` and is modified
--- by the script's functions. This is the table that would be read to update the game engine.
+-- Initialized with a deep copy of `originalGroundModelValues`, this table is
+-- modified by the script's functions (`modify_ground_parameters_on_spin` and
+-- `recover_ground_parameters`). The values in `M.data` are intended to be read
+-- and applied to the BeamNG physics engine via external API calls.
 M.data = {
   MUD = deepcopy(originalGroundModelValues.MUD),
   SAND = deepcopy(originalGroundModelValues.SAND)
 }
 
 -- Defines operational limits (min/max) for dynamically modified parameters.
--- This prevents parameters from reaching unrealistic or engine-breaking values.
--- Max values for some parameters are set to their original values to ensure
--- recovery doesn't overshoot and "improve" the ground beyond its initial state.
+-- This prevents parameters from reaching unrealistic values or values that might
+-- cause issues with the physics engine. Max values for some parameters (e.g.,
+-- shearStrength, frictionCoefficients) are capped at their original values to ensure
+-- recovery doesn't "improve" the ground beyond its initial defined state.
 local parameter_limits = {
   MUD = {
-    defaultDepth = { min = 0.05, max = 0.8 }, -- Min depth, Max possible dug-out depth
-    shearStrength = { min = 500, max = originalGroundModelValues.MUD.shearStrength }, -- Min strength, Max is original
+    defaultDepth = { min = 0.05, max = 0.8 },
+    shearStrength = { min = 500, max = originalGroundModelValues.MUD.shearStrength },
     staticFrictionCoefficient = { min = 0.1, max = originalGroundModelValues.MUD.staticFrictionCoefficient },
     slidingFrictionCoefficient = { min = 0.1, max = originalGroundModelValues.MUD.slidingFrictionCoefficient },
-    hydrodynamicFriction = {min = 0.005, max = 0.05}, -- Can increase beyond original if very churned
-    flowConsistencyIndex = {min = 1000, max = 3000} -- Can change from original
+    hydrodynamicFriction = {min = 0.005, max = 0.05},
+    flowConsistencyIndex = {min = 1000, max = 3000}
   },
   SAND = {
     defaultDepth = { min = 0.02, max = 1.0 },
@@ -182,10 +192,10 @@ function M:getMaterialNameById(material_id)
     end
 
     local id_str = tostring(material_id) -- Ensure ID is string for cache consistency.
-    if self.materialNameCache and self.materialNameCache[id_str] then -- Check cache first (even if it's empty).
+    if self.materialNameCache and self.materialNameCache[id_str] then -- Check cache first (even if it's empty from a failed API call).
         return self.materialNameCache[id_str]
     end
-    
+
     -- Fallback to a comprehensive list of known common material IDs if cache lookup fails or cache is empty.
     -- The primary method (editor_terrainEditor) is preferred. This list is a secondary measure.
     -- log('D', 'DynamicGround', 'Material ID ' .. id_str .. ' not found via editor_terrainEditor or cache. Using comprehensive fallback list.')
@@ -193,10 +203,10 @@ function M:getMaterialNameById(material_id)
     -- !! USER ACTION REQUIRED FOR FALLBACKS !!
     -- The following numeric IDs are based on a standard older groundModels.json but MAY NOT BE ACCURATE
     -- for your specific map or BeamNG version. VERIFY these if the editor API method fails or is not available.
-    -- These are matched against the raw `material_id` (number).
+    -- These are matched against the raw `material_id` (number type).
     if material_id == 0 then return "ASPHALT"       -- Common default, often used as a base.
-    elseif material_id == 10 then return "ASPHALT"     -- Previously an example for MUD, but often ASPHALT in some setups. Verify!
-    elseif material_id == 11 then return "ASPHALT_WET" -- Previously an example for SAND. Verify!
+    elseif material_id == 10 then return "ASPHALT"     -- Note: ID 10 was an old example for MUD, but often maps to ASPHALT in some setups. User must verify.
+    elseif material_id == 11 then return "ASPHALT_WET" -- Note: ID 11 was an old example for SAND. User must verify.
     elseif material_id == 16 then return "SAND"
     elseif material_id == 7  then return "BRANCHES_STRONG" -- Or a more generic "FOLIAGE" if preferred and if its properties match.
     elseif material_id == 30 then return "COBBLESTONE"
@@ -218,7 +228,7 @@ function M:getMaterialNameById(material_id)
     -- Add more verified fallback mappings here based on your specific map/BeamNG version if necessary.
     -- e.g., elseif material_id == your_map_specific_mud_id then return "MUD"
     end
-    
+
     return "UNKNOWN_MATERIAL_ID_" .. id_str
 end
 
@@ -274,10 +284,10 @@ function M:modify_ground_parameters_on_spin(spinning_wheels, dt)
     local ground_params = self.data[material_type]
     local limits = parameter_limits[material_type]
     if ground_params and limits then
-      local depth_increase_factor = 0.005 
-      local strength_decrease_factor = -50 
-      local friction_decrease_factor = -0.01 
-      local hydro_friction_increase_factor = 0.0001 
+      local depth_increase_factor = 0.005
+      local strength_decrease_factor = -50
+      local friction_decrease_factor = -0.01
+      local hydro_friction_increase_factor = 0.0001
       local flow_consistency_change_factor = 10
       local slip_effect_this_step = wheel_data.slipAmount * dt
       ground_params.defaultDepth = math.max(limits.defaultDepth.min, math.min(limits.defaultDepth.max, ground_params.defaultDepth + (slip_effect_this_step * depth_increase_factor)))
@@ -409,6 +419,89 @@ properties (specifically MUD and SAND) based on vehicle wheel spin.
      --     end
      -- end
      ```
+--## Alternative Integration: Copying and Modifying an Existing Game Script
+--
+-- This method is often more straightforward for ensuring your script runs in the correct
+-- context (e.g., a specific vehicle's context) and at the correct physics update frequency.
+--
+-- **Concept:**
+-- You will make a copy of an existing official BeamNG Lua script, place it in your mod's
+-- directory so it overrides the original for a chosen scope (e.g., for a specific vehicle),
+-- and then add the necessary calls to our `dynamic_ground.lua` script within that copied file.
+--
+-- **Steps:**
+--
+-- 1. **Choose and Copy the Target Script:**
+--    - Identify an official BeamNG Lua script that runs in the desired context and has a
+--      physics update function (e.g., `update(dt)`, `onPhysicsUpdate(dt)`).
+--    - Examples:
+--        - For applying to a specific vehicle: Locate the vehicle's main Lua file
+--          (e.g., `/lua/vehicle/pickup/pickup.lua`).
+--        - For a more global effect (use with caution): You might consider a copy of
+--          `vehicleController.lua` if you understand its scope and implications.
+--    - Copy this chosen script into your mod's corresponding Lua directory. For example, if
+--      you copy `/lua/vehicle/pickup/pickup.lua`, you might place your modified version in
+--      `/mods/your_mod_name/lua/vehicle/pickup/pickup.lua`. BeamNG's virtual file system
+--      should then prioritize your mod's version.
+--
+-- 2. **Require `dynamic_ground.lua` in Your Copied Script:**
+--    - At or near the top of your *copied and modified* script, add:
+--      ```lua
+--      local dynamicGroundSystem = require('your_mod_name/lua/dynamic_ground') -- Adjust this path!
+--      ```
+--      - **Important:** The path `your_mod_name/lua/dynamic_ground` must correctly point
+--        to where `dynamic_ground.lua` is located within your mod structure, relative
+--        to BeamNG's Lua root or using BeamNG's mod pathing conventions.
+--        For example, if `dynamic_ground.lua` is in `mods/your_mod_name/lua/common/dynamic_ground.lua`,
+--        the path might be `common/dynamic_ground` if your mod's `lua` folder is directly mapped,
+--        or `your_mod_name/lua/common/dynamic_ground`.
+--
+-- 3. **Locate the Physics Update Function:**
+--    - Inside your copied script, find a function that is executed every physics step.
+--      This function typically receives `dt` (delta time) as an argument. Common names include
+--      `update(dt)`, `onPhysicsUpdate(dt)`, or vehicle-specific update handlers.
+--
+-- 4. **Call `dynamic_ground_system:update_dynamic_ground(dt)`:**
+--    - Within the physics update function you identified, add the following lines:
+--      ```lua
+--      -- Inside the existing physics update function (e.g., update(dt))
+--      if dynamicGroundSystem and dynamicGroundSystem.update_dynamic_ground then
+--          dynamicGroundSystem:update_dynamic_ground(dt)
+--      end
+--      ```
+--
+-- **Example (Conceptual - if modifying a vehicle's `update(dt)` function):**
+--   ```lua
+--   -- At the top of your copied vehicle script (e.g., my_mod/lua/vehicle/somecar/somecar.lua)
+--   local dynamicGroundSystem = require('my_mod/lua/dynamic_ground') -- Adjust path
+--
+--   -- ... other vehicle script code ...
+--
+--   local function update(dt, dtSim, dtInput) -- Existing function signature might vary
+--       -- ... original code from the vehicle's update function ...
+--
+--       -- Call the dynamic ground system
+--       if dynamicGroundSystem and dynamicGroundSystem.update_dynamic_ground then
+--           dynamicGroundSystem:update_dynamic_ground(dt) -- Or dtSim, if more appropriate
+--       end
+--
+--       -- ... possibly more original code ...
+--   end
+--
+--   -- ... rest of vehicle script ...
+--   ```
+--
+-- **Advantages:**
+--   - **Correct Context:** Your code runs with the intended scope and data access (e.g., vehicle-specific).
+--   - **Reliable Updates:** Leverages an existing, engine-managed update loop.
+--   - **Simpler Setup:** Avoids needing to create and register new global update handlers.
+--
+-- **Disadvantages:**
+--   - **Mod Conflicts:** If another mod modifies the same official script, only one version will load (usually based on load order/priority), potentially causing one of the mods to not function as intended.
+--   - **Game Updates:** When BeamNG.drive updates, if the official script you copied changes, your modified version might become outdated, break, or miss new official functionality. You'll need to re-apply your modifications to the updated official script (a common mod maintenance task).
+--
+-- **Recommendation:**
+-- This method is generally recommended for vehicle-specific mods or when you need to ensure execution within a very specific existing game context. Always back up original files or manage your mod with a clear understanding of file overrides.
 
 4. CRITICAL USER TASK: Material Identification (`M:getMaterialNameById`):
    - The function `M:getMaterialNameById(material_id)` is crucial for identifying MUD and SAND.
@@ -437,7 +530,64 @@ properties (specifically MUD and SAND) based on vehicle wheel spin.
        numeric IDs through testing or other game tools.
    - **Without correct material identification, dynamic effects will not apply to MUD/SAND.**
 
-5. Dependencies & API Assumptions:
+5. Engine Interaction: Applying Calculated Parameters (Advanced & BeamNG-Specific)
+--
+-- **IMPORTANT CLARIFICATION:**
+-- This script (`dynamic_ground.lua`) calculates the *desired target parameters* for soft
+-- surfaces like MUD and SAND based on vehicle interaction (e.g., `M.data.MUD.defaultDepth`).
+-- However, this script **DOES NOT directly modify the game's physics engine or ground properties.**
+--
+-- BeamNG.drive's ground model system is complex. While `groundModelDebugMode` might allow
+-- dynamic reading or visualization of parameters, dynamically changing the physical properties
+-- of a *specific, localized area of the main ground model* at runtime for normal gameplay
+-- via Lua is a significant challenge and may not be directly supported through simple API calls.
+--
+-- **Therefore, to see the effects calculated by this script, you will need to investigate
+-- and implement BeamNG-specific methods. This is an advanced modding task.**
+--
+-- Possible approaches you might need to research include:
+--
+--   a. **Tire-Specific Physics Overrides:**
+--      - Are there Lua APIs to alter how individual tires interact with the *existing*
+--        ground? For example, can you temporarily modify a specific tire's friction
+--        coefficients, or apply forces to it that simulate sinking deeper, based on
+--        the parameters calculated by this script? This would change the vehicle's
+--        behavior without altering the global ground model itself.
+--
+--   b. **Localized Physics Effects:**
+--      - Can your mod spawn temporary, invisible physics entities or apply localized forces
+--        (e.g., a downward force under spinning wheels) that simulate the *effect* of
+--        changed ground?
+--
+--   c. **Visual-Only Changes:**
+--      - If direct physics modification proves too difficult or is not feasible, this script's
+--        logic can still be used to drive *visual-only* changes. For example, you could
+--        trigger deeper mud/sand decals or more intense particle effects under spinning
+--        wheels based on the calculated `defaultDepth` or `slip_amount`.
+--
+--   d. **Custom Shaders or Terrain Data Manipulation:**
+--      - Very advanced modding might explore if there are ways to interact with terrain
+--        data or rendering shaders, but this is typically highly complex.
+--
+--   e. **Discovering Specific Runtime Ground APIs (If They Exist for Gameplay):**
+--      - Continue to explore BeamNG community resources (forums, Discord), official
+--        documentation, and other complex mods to see if any Lua functions exist that
+--        *do* allow for localized, runtime modification of effective ground properties
+--        for gameplay purposes. Be aware that APIs available in editor tools might not
+--        always be available or behave the same way in live gameplay.
+--
+-- **How to Use This Script's Output:**
+-- The `M.data.MUD` and `M.data.SAND` tables within this script will contain the dynamically
+-- calculated parameters. Your custom engine integration code would need to:
+--   1. Read these values (e.g., `dynamicGroundSystem.data.MUD.defaultDepth`).
+--   2. Use them as inputs for whichever of the above (or other) methods you implement
+--      to affect the vehicle's interaction with the world.
+--
+-- This script provides the "what should happen" logic; the "how to make it happen
+-- in BeamNG's physics engine" is a separate and advanced implementation step you
+-- will need to undertake.
+
+6. Dependencies & API Assumptions:
    - `be:getPlayerVehicle(0)`: To get the current player vehicle.
    - `veh.wheels`: A collection (likely array) of wheel objects/tables.
    - Wheel Properties: `name`, `contactMaterialID1`, `contactDepth`, `angularVelocity`,
@@ -446,11 +596,6 @@ properties (specifically MUD and SAND) based on vehicle wheel spin.
    - `editor_terrainEditor.getMaterialsInJson()`: Conditionally used for material name caching.
      If unavailable, the script relies on user-configured fallbacks in `M:getMaterialNameById`.
    - Exact property names/structures might vary with mods or BeamNG versions; adjust if needed.
-
-6. Engine Interaction (Conceptual - IMPORTANT):
-   - This script manages Lua tables (`M.data.MUD`, `M.data.SAND`). To affect in-game physics,
-     you must use BeamNG-specific Lua APIs to apply these values to the engine's ground models.
-     This "bridging" step is external to this script.
 
 7. Accessing Modified Data:
    - Read current parameters from `dynamicGroundSystem.data.MUD` or `dynamicGroundSystem.data.SAND`.
@@ -537,3 +682,5 @@ to test the script's functionality within BeamNG:
         The script is designed to fall back. The key is to ensure the fallbacks are accurate.
 ------------------------------------------------------------------------------------------
 ]]
+
+[end of dynamic_ground.lua]
